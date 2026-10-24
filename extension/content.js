@@ -1,17 +1,11 @@
-// ==UserScript==
-// @name         PRUN 生产队列面板
-// @namespace    https://github.com/wwr650/prun-tool
-// @version      0.1.0
-// @description  在 APEX 里自定义生产队列，用 prunplanner 配方一键批量下单（默认干跑）
-// @author       wwr650
-// @match        https://apex.prosperousuniverse.com/*
-// @connect      api.prunplanner.org
-// @grant        GM_xmlhttpRequest
-// @run-at       document-idle
-// ==/UserScript==
+// PRUN 生产队列面板 —— Chrome 扩展（MV3）内容脚本
+// 匹配规则写在 manifest.json 里，不进油猴，不依赖 GM_* 接口。
 
 (function () {
   'use strict';
+
+  // 油猴脚本和本扩展用同一套 DOM id，迁移期两个都在会互相盖住
+  if (document.getElementById('prun-tab') || document.getElementById('prun-open')) return;
 
   var RECIPES_URL = 'https://api.prunplanner.org/data/recipes/';
   var K_RECIPES = 'prun.recipes.v1';
@@ -75,25 +69,20 @@
     } catch (e) { /* 存储满时静默降级为内存态 */ }
   }
 
-  function httpGetText(url) {
-    return new Promise(function (resolve, reject) {
-      if (typeof GM_xmlhttpRequest === 'function') {
-        GM_xmlhttpRequest({
-          method: 'GET', url: url, timeout: 30000,
-          onload: function (r) {
-            if (r.status >= 200 && r.status < 300) resolve(r.responseText);
-            else reject(new Error('HTTP ' + r.status));
-          },
-          onerror: function () { reject(new Error('请求失败（网络或被拦截）')); },
-          ontimeout: function () { reject(new Error('请求超时')); }
-        });
-      } else {
-        fetch(url).then(function (r) {
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          return r.text();
-        }).then(resolve, reject);
-      }
-    });
+  // 内容脚本里的 fetch 走页面源，prunplanner 允许跨源（实测 APEX 页面直接 200）
+  async function httpGetText(url) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, 30000);
+    var r;
+    try {
+      r = await fetch(url, { signal: ctl.signal });
+    } catch (e) {
+      throw new Error(e.name === 'AbortError' ? '请求超时' : '请求失败（网络或被拦截）');
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.text();
   }
 
   // ---------------------------------------------------------------- recipes
@@ -917,10 +906,13 @@
     return listLines(tile).map(function (l) { return l.name; });
   }
 
-  function buildPanel() {
+  // 样式必须在入口挂载时就注入：侧边标签自己没有样式的话，会退化成贴满页面宽度的块
+  function injectStyle() {
+    if (document.getElementById('prun-style')) return;
     var style = el('style');
+    style.id = 'prun-style';
     style.textContent = [
-      '#prun-panel{position:fixed;right:16px;top:64px;width:470px;max-height:82vh;display:flex;flex-direction:column;',
+      '#prun-panel{position:fixed;right:48px;top:64px;width:470px;max-height:82vh;display:flex;flex-direction:column;',
       'z-index:2147483000;background:#12161d;color:#d6dde8;border:1px solid #2f3a49;border-radius:8px;',
       'font:12px/1.5 system-ui,"Microsoft YaHei",sans-serif;box-shadow:0 8px 28px rgba(0,0,0,.55)}',
       '#prun-panel header{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #2f3a49;cursor:move}',
@@ -947,11 +939,17 @@
       '#prun-panel button.act{background:#2d6cdf;color:#fff;border:0;border-radius:4px;padding:4px 10px;cursor:pointer}',
       '#prun-panel button.warn{background:#b8860b;color:#fff;border:0;border-radius:4px;padding:4px 10px;cursor:pointer}',
       '#prun-panel .dim{color:#7d8899}',
-      '#prun-open{position:fixed;right:16px;top:16px;z-index:2147483000;background:#2d6cdf;color:#fff;border:0;border-radius:4px;padding:5px 10px;cursor:pointer;font:12px system-ui}',
+      '#prun-tab{position:fixed;right:0;top:120px;z-index:2147483001;width:32px;height:36px;display:flex;align-items:center;',
+      'justify-content:center;background:#2d6cdf;color:#fff;border:1px solid #1f4e9e;border-right:0;border-radius:8px 0 0 8px;',
+      'cursor:pointer;font:16px/1 system-ui;box-shadow:-2px 3px 10px rgba(0,0,0,.5);user-select:none}',
+      '#prun-tab:hover{background:#3f7de0}',
       '.prun-hide{display:none!important}'
     ].join('\n');
     document.head.appendChild(style);
+  }
 
+  function buildPanel() {
+    injectStyle();
     var p = el('div');
     p.id = 'prun-panel';
     var head = el('header');
@@ -1473,8 +1471,11 @@
   }
 
   function addTrigger() {
-    var b = el('button', null, '生产队列');
-    b.id = 'prun-open';
+    injectStyle();
+    // 侧边标签贴在视口右缘，不占用游戏顶栏
+    var b = el('div', null, '★');
+    b.id = 'prun-tab';
+    b.title = '生产队列（Alt+Q）';
     b.onclick = toggle;
     document.body.appendChild(b);
   }
