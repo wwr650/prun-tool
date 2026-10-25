@@ -12,6 +12,7 @@
   var K_QUEUE = 'prun.queue.v1';
   var K_SCANNED = 'prun.scanned.v1';
   var K_TPLGROUP = 'prun.tplgroup.v1';
+  var K_DRYRUN = 'prun.dryrun.v1';
 
   // APEX 用 CSS Modules，类名带哈希后缀且随构建变化，只能按前缀匹配
   function byClass(root, part) {
@@ -98,6 +99,7 @@
     tplOut: '',
     tplLine: '',
     tplOpen: lsGet(K_TPLGROUP, {}),
+    dryRun: lsGet(K_DRYRUN, false),
     log: []
   };
 
@@ -626,7 +628,8 @@
     await nextFrame();
   }
 
-  async function setOrderSize(form, target, baseMs) {
+  // unitSlack：模板上那行单件耗时被显示截断的最大幅度（显示到小时就最多差 1 小时）
+  async function setOrderSize(form, target, baseMs, unitSlack) {
     var handle = form.querySelector('.rc-slider-handle');
     var box = form.querySelector('.rc-slider');
     if (!handle || !box) throw new Error('找不到订单大小滑块');
@@ -635,26 +638,31 @@
     if (isNaN(min) || isNaN(max) || max <= min) { min = 1; max = 20; }
     if (!box.getBoundingClientRect().width) throw new Error('订单大小滑块还没渲染出来');
     var want = Math.max(min, Math.min(max, target));
-    var expect = baseMs ? baseMs * want : NaN;
+    // 单件耗时是截断过的，误差会乘以订单大小：区间必须按 want 展开，
+    // 否则大订单必然落在区间外，把已经设对的滑块误判成没生效
+    var lo = baseMs ? baseMs * want : NaN;
+    var hi = baseMs ? (baseMs + (unitSlack || 0)) * want : NaN;
     var last = '';
     function applied() {
       var now = Number(handle.getAttribute('aria-valuenow'));
       var rng = readCostRange(form);
-      var ok = !rng || isNaN(expect) ? true : expect >= rng.lo && expect <= rng.hi;
-      last = '滑块 ' + now + '，表单耗时 ' + (rng ? rng.txt : '读不到') + '，应为 ' + fmtMs(expect);
+      var ok = !rng || isNaN(lo) ? true : rng.lo <= hi && rng.hi >= lo;
+      last = '滑块 ' + now + '，表单耗时 ' + (rng ? rng.txt : '读不到') +
+        '，应为 ' + (isNaN(lo) ? '?' : fmtMs(lo) + '~' + fmtMs(hi));
       return now === want && ok;
     }
     for (var attempt = 0; attempt < 3; attempt++) {
       var cur = Number(handle.getAttribute('aria-valuenow'));
       // 滑块读数已经等于目标值但耗时对不上时，原地拖没有位移、React 不会重放 onChange，
-      // 所以先拖偏一格再拖回来，逼它产生一次真实变化
+      // 所以得先拖到别处再拖回来，逼它产生一次真实变化。偏移量取整条行程：
+      // 只错开一格时指针位移太小，实测会被 rc-slider 吃掉（日志里出现过拖完仍停在原值）
       var start = want;
       if (attempt === 0 && cur !== want) start = cur;
-      else start = want === max ? want - 1 : want + 1;
+      else start = want <= min ? max : min;
       start = Math.max(min, Math.min(max, start));
       await dragSlider(box, handle, start, want);
       if (await waitFor(applied, 600, '订单大小生效').catch(function () { return false; })) {
-        if (!readCostRange(form) || isNaN(expect)) log('  订单大小 ' + want + '（时长读不到，只核对了滑块读数）');
+        if (!readCostRange(form) || isNaN(lo)) log('  订单大小 ' + want + '（时长读不到，只核对了滑块读数）');
         return want;
       }
       log('  订单大小未生效，重试 ' + (attempt + 1) + '：' + last);
@@ -689,15 +697,24 @@
     return Number(m[1].replace(/[,.](?=\d{3})/g, '').replace(',', '.'));
   }
 
-  // 下单被两道闸门卡住：队列位不足、仓储不满足输入需求。表单里没有报错文字，
-  // 只能自己读输入材料行算出来，否则只能看到"按钮是灰的"这种无用信息
-  function readAvailability(form) {
-    var holder = form.parentElement || form;
-    var view = one(holder, 'InputsOutputsView__container') || one(document, 'InputsOutputsView__container');
+  // 下单闸门：表单里没有报错文字，只能自己读材料行。读不到原因时一律标成「未知」
+  // 并把原始证据打出来，不要再猜「队列已满」——抽取线根本没有输入行，那条猜测必然错
+  function readMaterials(form, which) {
+    // 只认这个对话框自己的材料表：全文档兜底查询会捞到别的（已隐藏）窗口留下的旧表单
+    var scope = form.closest('[class*="Window__window"]') || form.parentElement || form;
+    var view = one(scope, 'InputsOutputsView__container');
+    if (!view) {
+      // 兜底也只认看得见的那个：窗口是缓存的，隐藏的旧窗口里还挂着自己的材料表
+      var vis = byClass(document, 'InputsOutputsView__container').filter(function (v) {
+        var w = v.closest('[class*="Window__window"]');
+        return (v.offsetWidth || v.offsetHeight) || (w && (w.offsetWidth || w.offsetHeight));
+      });
+      view = vis[vis.length - 1] || null;
+    }
     if (!view) return [];
-    var inputs = one(view, 'InputsOutputsView__inputs');
-    if (!inputs) return [];
-    return byClass(inputs, 'InputsOutputsView__materialContainer').map(function (m) {
+    var side = one(view, 'InputsOutputsView__' + which);
+    if (!side) return [];
+    return byClass(side, 'InputsOutputsView__materialContainer').map(function (m) {
       var t = text(one(m, 'ColoredIcon__label'));
       var raw = text(one(m, 'InputsOutputsView__amount'));
       var perCycle = parseNum(raw);
@@ -705,6 +722,10 @@
       var avail = avEl ? parseNum(text(avEl)) : parseNum((/仓储中有([\d,.]+)/.exec(raw) || [])[1]);
       return { ticker: t, perCycle: perCycle, avail: avail };
     }).filter(function (x) { return x.ticker; });
+  }
+
+  function readAvailability(form) {
+    return readMaterials(form, 'inputs');
   }
 
   function maxAffordableSize(rows, fallback) {
@@ -717,19 +738,28 @@
     return Math.max(0, limit);
   }
 
+  function fmtRow(r, size) {
+    return r.ticker + ' 单件需 ' + r.perCycle + '，x' + size + ' 要 ' + (r.perCycle * size) + '，仓储 ' + r.avail;
+  }
+
   function describeBlock(form, size) {
     var rows = readAvailability(form);
     var short = rows.filter(function (r) { return r.perCycle > 0 && r.avail < r.perCycle * size; });
     if (short.length) {
       return {
         reason: '库存不足',
-        detail: short.map(function (r) {
-          return r.ticker + ' 需 ' + (r.perCycle * size) + '，仓储 ' + r.avail;
-        }).join('；'),
+        detail: short.map(function (r) { return fmtRow(r, size); }).join('；'),
         affordable: maxAffordableSize(rows, size)
       };
     }
-    return { reason: '队列已满', detail: '输入材料够，说明该生产线的排队位已占满', affordable: null };
+    var bits = [];
+    bits.push(rows.length ? '输入无缺口（' + rows.map(function (r) { return fmtRow(r, size); }).join('；') + '）' : '表单里没读到输入行');
+    var outs = readMaterials(form, 'outputs');
+    if (outs.length) bits.push('成品 ' + outs.map(function (r) { return r.ticker + ' 单件产 ' + r.perCycle + '，仓储 ' + r.avail; }).join('；'));
+    var btn = submitButton(form);
+    bits.push('按钮 ' + (btn ? (btn.disabled ? 'disabled属性' : '无disabled属性') + ' class=' +
+      String(btn.className).split(/\s+/).filter(function (c) { return /disab|utton/i.test(c); }).join(' ') : '没找到'));
+    return { reason: '禁用原因未知', detail: bits.join(' · '), affordable: null };
   }
 
   function submitButton(form) {
@@ -746,12 +776,15 @@
     try {
       var tpl = await selectTemplate(form, entry.sig);
       var baseMs = parseDurationMs(tpl.duration);
+      // 单件耗时显示到哪一档，截断误差就有多大（显示到小时则最多差 1 小时）
+      var unitSlack = /分/.test(tpl.duration) ? 60000 :
+        (/小时/.test(tpl.duration) ? 3600000 : 86400000);
       var size = sizeWanted;
       // 先定模式再定大小：切「重复/单次」可能把滑块弹回原位，顺序反了校验就白做了。
       // 这里恒传 false：APEX 自带的「重复订单」会让游戏无限重复该订单，
       // 队列填满由本脚本的轮转负责，两者语义不同，不能同时开
       await setRepeat(form, false);
-      await setOrderSize(form, size, baseMs);
+      await setOrderSize(form, size, baseMs, unitSlack);
       var btn = submitButton(form);
       if (!btn) throw new Error('找不到下单按钮');
       var ready = btn.className.indexOf('Button__disabled') < 0;
@@ -759,7 +792,7 @@
       if (!ready && entry.autoFit && block && block.reason === '库存不足' &&
           block.affordable >= 1 && block.affordable < size) {
         size = Math.min(block.affordable, 20);
-        await setOrderSize(form, size, baseMs);
+        await setOrderSize(form, size, baseMs, unitSlack);
         ready = btn.className.indexOf('Button__disabled') < 0;
         block = ready ? null : describeBlock(form, size);
         log('  自动降档 x' + sizeWanted + ' → x' + size);
@@ -806,7 +839,7 @@
             continue;
           }
           log('  干跑：' + line.name + ' ' + r.tpl.label + ' x' + r.size +
-            '，表单耗时 ' + fmtMs(r.cost) + '，已就绪未提交' +
+            '，表单耗时 ' + r.cost + '，已就绪未提交' +
             (entry.repeat ? '；真实执行会轮转填满，上限 ' + (entry.repeatMax || 20) + ' 单' : ''));
           return { placed: false, dry: true };
         }
@@ -815,7 +848,7 @@
           log('  跳过 ' + line.name + '：' + block);
           continue;
         }
-        log('  已下单 ' + line.name + ' x' + r.size + '（表单耗时 ' + fmtMs(r.cost) + '）：' + r.tpl.label);
+        log('  已下单 ' + line.name + ' x' + r.size + '（表单耗时 ' + r.cost + '）：' + r.tpl.label);
         refreshStatus();
         return { placed: true, size: r.size, line: line.name };
       } catch (e) {
@@ -829,6 +862,18 @@
 
   // 多条一起勾选重复填满时按队列顺序轮转：一轮里每条各下一单，而不是一条灌满再换下一条
   async function runQueue(dryRun) {
+    if (running) { log('已在执行中，忽略本次触发'); return; }
+    running = true;
+    syncRunBtn();
+    try {
+      await runQueueInner(dryRun);
+    } finally {
+      running = false;
+      syncRunBtn();
+    }
+  }
+
+  async function runQueueInner(dryRun) {
     var entries = state.queue.filter(function (e) { return e.on; });
     if (!entries.length) { log('队列为空'); return; }
     var caps = entries.map(function (e) { return orderCount(e); });
@@ -877,6 +922,18 @@
   var panel = null;
   var refs = {};
   var realRun = false;
+  var running = false;
+
+  // 队列页底部的执行按钮：模式来自执行页的干跑开关（默认不干跑），这里只复述当前档位
+  function syncRunBtn() {
+    if (!refs.run) return;
+    refs.run.textContent = running
+      ? '执行中…'
+      : '执行队列（' + (state.dryRun ? '干跑' : '真实下单') + '）';
+    refs.run.classList.toggle('warn', !state.dryRun);
+    refs.run.classList.toggle('act', state.dryRun);
+    refs.run.disabled = running;
+  }
 
   function log(msg) {
     var line = (msg.indexOf('  ') === 0 ? '    ' : '') + '[' + new Date().toLocaleTimeString() + '] ' + msg.replace(/^ +/, '');
@@ -1196,9 +1253,6 @@
     root.appendChild(refs.tplHint);
     renderTemplates();
 
-    root.appendChild(el('div', 'dim', '↓ 队列：执行时按从上到下轮转，一轮里每条勾选的各下一单'));
-    refs.queueList = el('div');
-    root.appendChild(refs.queueList);
     scan.onclick = function () {
       scan.disabled = true;
       scanLineTemplates().then(function (found) {
@@ -1260,6 +1314,23 @@
     };
     bar.appendChild(clr);
     root.appendChild(bar);
+
+    root.appendChild(el('div', 'dim', '↓ 队列：执行时按从上到下轮转，一轮里每条勾选的各下一单'));
+    refs.queueList = el('div');
+    root.appendChild(refs.queueList);
+
+    // 排好队直接在这一页点执行；是否干跑在执行页配置，这里不弹任何确认
+    var sep = el('div', 'dim');
+    sep.style.cssText = 'padding-top:6px;border-top:1px solid #2f3a49';
+    sep.textContent = '↓ 执行：按上方队列顺序轮转；是否干跑在「执行」页配置（默认不干跑）';
+    root.appendChild(sep);
+    var rrow = el('div', 'row');
+    refs.run = el('button', 'act', '执行队列');
+    refs.run.style.flex = '1';
+    refs.run.onclick = function () { runQueue(state.dryRun); };
+    rrow.appendChild(refs.run);
+    root.appendChild(rrow);
+    syncRunBtn();
   }
 
   function renderQueue() {
@@ -1401,31 +1472,20 @@
     var r1 = el('div', 'row');
     refs.dryRun = el('input');
     refs.dryRun.type = 'checkbox';
-    refs.dryRun.checked = true;
+    refs.dryRun.checked = state.dryRun;
     refs.dryRun.onchange = function () {
-      if (!refs.dryRun.checked) {
-        var ok = window.confirm('关闭干跑会真实提交生产订单。\n确认要执行真实下单吗？');
-        if (!ok) refs.dryRun.checked = true;
-      }
+      state.dryRun = refs.dryRun.checked;
+      lsSet(K_DRYRUN, state.dryRun);
+      log('执行模式：' + (state.dryRun ? '干跑（不提交，只验证能否下单）' : '真实下单'));
+      syncRunBtn();
     };
     var dl = el('label', null, '干跑（不提交，只验证能否下单）');
     dl.insertBefore(refs.dryRun, dl.firstChild);
     r1.appendChild(dl);
+    r1.appendChild(el('span', 'dim', '队列页的「执行队列」按这里的档位运行'));
     root.appendChild(r1);
 
     var r2 = el('div', 'row');
-    var run = el('button', 'act', '执行队列');
-    run.onclick = function () {
-      if (refs.dryRun.checked) {
-        runQueue(true);
-      } else {
-        if (!window.confirm('最后一次确认：将向 APEX 真实提交最多 ' +
-          state.queue.filter(function (e) { return e.on; }).reduce(function (s, e) { return s + orderCount(e); }, 0) +
-          ' 张生产订单（' + state.queue.filter(function (e) { return e.on; }).length + ' 条配方按队列顺序轮转）。')) return;
-        runQueue(false);
-      }
-    };
-    r2.appendChild(run);
     var stat = el('button', null, '读取当前队列');
     stat.onclick = function () {
       var tile = prodTile();
@@ -1452,6 +1512,37 @@
     refs.log = el('textarea');
     refs.log.readOnly = true;
     root.appendChild(refs.log);
+
+    var r3 = el('div', 'row');
+    var expLog = el('button', 'act', '导出日志');
+    expLog.onclick = function () {
+      if (!state.log.length) { log('日志是空的，没什么可导出'); return; }
+      var d = new Date();
+      var p = function (n) { return (n < 10 ? '0' : '') + n; };
+      var name = 'prun-log_' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) +
+        '-' + p(d.getHours()) + p(d.getMinutes()) + '.txt';
+      try {
+        var url = URL.createObjectURL(new Blob([state.log.join('\n')], { type: 'text/plain;charset=utf-8' }));
+        var a = el('a');
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+        log('已导出日志 ' + state.log.length + ' 行 → ' + name);
+      } catch (e) {
+        log('导出日志失败：' + e.message);
+      }
+    };
+    r3.appendChild(expLog);
+    var clrLog = el('button', 'warn', '清空日志');
+    clrLog.onclick = function () {
+      state.log = [];
+      if (refs.log) refs.log.value = '';
+    };
+    r3.appendChild(clrLog);
+    root.appendChild(r3);
   }
 
   // ---------------------------------------------------------------- boot
