@@ -11,8 +11,10 @@
   var K_RECIPES = 'prun.recipes.v1';
   var K_QUEUE = 'prun.queue.v1';
   var K_SCANNED = 'prun.scanned.v1';
+  var K_LINES = 'prun.lines.v1';
   var K_TPLGROUP = 'prun.tplgroup.v1';
   var K_DRYRUN = 'prun.dryrun.v1';
+  var K_RESUME = 'prun.resume.v1';
 
   // APEX 用 CSS Modules，类名带哈希后缀且随构建变化，只能按前缀匹配
   function byClass(root, part) {
@@ -91,8 +93,11 @@
   var state = {
     recipes: lsGet(K_RECIPES, []),
     recipesAt: lsGet('prun.recipes.at', null),
-    queue: lsGet(K_QUEUE, []),
+    // 从 localStorage 恢复时同样过一遍 normalizeEntry：老数据/导入的 JSON 可能没有
+    // on、line 这些字段，不补齐的话界面上显示「参与执行」而 runQueue 按 on=undefined 把它跳过
+    queue: (lsGet(K_QUEUE, []) || []).map(normalizeEntry).filter(Boolean),
     scanned: lsGet(K_SCANNED, []),
+    lines: lsGet(K_LINES, {}),
     lineMap: lsGet('prun.linemap', {}),
     filterOut: '',
     filterTicker: '',
@@ -100,6 +105,8 @@
     tplLine: '',
     tplOpen: lsGet(K_TPLGROUP, {}),
     dryRun: lsGet(K_DRYRUN, false),
+    // 执行前先读线上已排好的队列，从最后一单之后续排（默认开）
+    resume: lsGet(K_RESUME, true),
     log: []
   };
 
@@ -130,60 +137,216 @@
     return i + ' => ' + o;
   }
 
-  // 队列条目的星球不单独存，按 生产线+签名 回查扫描结果，改线或重扫后不会留下过期值
-  function locFor(e) {
+  // 基地码优先取条目上存的，没存过（老队列、旧导入档）才按线名回查扫描结果
+  function codeFor(e) {
+    if (e.code) return e.code;
     if (!e.line || e.line === '自动') return '';
-    var hit = state.scanned.filter(function (t) { return t.line === e.line && t.sig === e.sig; })[0];
+    var hit = state.scanned.filter(function (t) { return t.line === e.line && t.code; })[0];
+    return hit ? hit.code : '';
+  }
+
+  // 星球码优先查 码→线 登记表（跟着当前瓦片走），再退回本次扫描结果
+  function locFor(e) {
+    var hit = infoFor(codeFor(e));
+    if (hit && hit.loc) return hit.loc;
+    if (!e.line || e.line === '自动') return '';
+    var t = state.scanned.filter(function (x) { return x.line === e.line && x.sig === e.sig; })[0];
+    return t ? t.loc : (hit ? hit.loc : '');
+  }
+
+  // 队列条目上的线标识：名字给眼睛看，队列 id 给同名基地做区分
+  function entryTag(e) {
+    var n = e.line || '自动';
+    var c = codeFor(e);
+    return (c && n.indexOf(c) < 0) ? n + ' PROD ' + c : n;
+  }
+
+  // 基地内部码是这条线的持久身份：`PROD bda98a38` 的 bda98a38。
+  // 码→(线名, 星球码) 单独存一张表，状态栏和文件名都按当前瓦片上的码现查，
+  // 所以切星球后重扫就会跟着变，不会一直显示上次扫描那个星球的信息
+  function infoFor(code) {
+    return (code && state.lines[code]) || null;
+  }
+  function locOfLine(line) {
+    var hit = infoFor(line.code);
     return hit ? hit.loc : '';
+  }
+  function harvestLines(lines) {
+    var changed = false;
+    lines.forEach(function (l) {
+      if (!l.code) return;
+      var rec = state.lines[l.code] || (state.lines[l.code] = {});
+      if (l.name && rec.name !== l.name) { rec.name = l.name; changed = true; }
+      if (!rec.loc) rec.loc = '';
+    });
+    if (changed) lsSet(K_LINES, state.lines);
+    return changed;
+  }
+  // 把当前瓦片上的线登记进 码→(线名, 星球码) 表；星球码只有开过下单框才拿得到，
+  // 开不了对话框的线至少把名字和码保住，状态栏还能报出这条线是谁
+  function harvestLine(line, loc) {
+    if (!line.code) return loc || '';
+    var rec = state.lines[line.code] || (state.lines[line.code] = {});
+    rec.name = rec.name || line.name;
+    if (rec.loc == null) rec.loc = '';
+    if (loc && rec.loc !== loc) {
+      rec.loc = loc;
+      lsSet(K_LINES, state.lines);
+    }
+    return rec.loc || loc || '';
+  }
+
+  // 状态栏上的一条线：线名 + 星球码。队列 id 是整条队列（这个基地）共用的，
+  // 上面那行瓦片 cmd 已经报了它，这里再逐条重复只会把状态栏撑爆
+  function lineInfoText(line) {
+    var hit = infoFor(line.code);
+    var loc = hit && hit.loc ? hit.loc : '未扫描';
+    return line.name + ' @' + loc;
   }
 
   // 队列条目下方那行：把用户选的参数复述一遍，控件挤掉也能看清方案
   function planText(e) {
     var p = [];
     var loc = locFor(e);
-    p.push('线=' + (e.line || '自动') + (loc ? ' @ ' + loc : ''));
+    p.push('线=' + entryTag(e) + (loc ? ' @ ' + loc : ''));
     p.push('大小=' + (e.size || 1));
-    p.push(e.repeat ? '重复填满（上限 ' + (e.repeatMax || 20) + ' 次）' : '单次');
+    p.push(e.repeat ? '重复填满（下到该线队列满）' : '单次');
     p.push(e.autoFit === false ? '不降档' : '库存不足自动降档');
     p.push(e.on === false ? '已停用' : '参与执行');
     return '方案 ' + p.join(' · ');
   }
 
-  // 一单耗时 = 配方单件时长 × 订单大小；勾了重复填满就按上限给最坏总耗时
+  // 一单耗时 = 配方单件时长 × 订单大小
   function orderMs(e) {
     return (e.time_ms || 0) * Math.max(1, e.size || 1);
   }
+  // 勾了重复填满不再有次数上限——以这条线队列满为限，所以单数事先算不出来，
+  // 用 Infinity 表示「只能靠读到队列满了才停」
   function orderCount(e) {
-    return e.repeat ? Math.max(1, e.repeatMax || 20) : 1;
+    return e.repeat ? Infinity : 1;
+  }
+
+  // ------------------------------------------------------- 工厂分组与续排
+
+  // 条目产出的材料缩写：sig 形如 `NSx4+H2Ox2=>MUSx12`，取 => 右边的第一项。
+  // 线上订单读回来的 ticker 就是同一套缩写，续排靠它把两边的位置对上。
+  // 只认小写 x 后面紧跟数字的那一段，缩写本身都是大写（H2O / LBS），不会误剥
+  function outTicker(e) {
+    var right = String(e.sig || '').split('=>')[1] || '';
+    if (!right || right === '-') return '';
+    var first = right.split('+')[0].trim();
+    var m = /^(.*?)x[\d.,]/.exec(first);
+    return (m ? m[1] : first).trim().toUpperCase();
+  }
+
+  // 一条工厂（生产线）= 队列 id + 线名；还没定线的条目自成一组，执行时才找线
+  function groupKey(e) {
+    return codeFor(e) + '|' + (e.line && e.line !== '自动' ? e.line : '');
+  }
+  function groupLabel(e) {
+    if (!e.line || e.line === '自动') return '未指定生产线';
+    var loc = locFor(e);
+    return entryTag(e) + (loc ? ' @ ' + loc : '');
+  }
+  // 按「首次出现」分组，组内保持数组顺序——那就是这一家的生产次序
+  function groupQueue(list) {
+    var groups = [];
+    var byId = {};
+    list.forEach(function (e) {
+      var k = groupKey(e);
+      var g = byId[k];
+      if (!g) {
+        g = byId[k] = { key: k, label: groupLabel(e), code: codeFor(e) || '',
+          line: e.line && e.line !== '自动' ? e.line : '', entries: [] };
+        groups.push(g);
+      }
+      g.entries.push(e);
+    });
+    return groups;
+  }
+
+  // 这一组对应哪条线：和 placeOnce 同一套口径（先用码锁基地，再用线名锁线），
+  // 但范围是所有已打开的瓦片，不再只盯第一个
+  function groupLine(groupsEntry, lines) {
+    var code = groupsEntry.code;
+    var name = groupsEntry.line;
+    var here = code ? lines.filter(function (l) { return l.code === code; }) : lines;
+    if (!here.length) return null;
+    return name ? (matchNamed(here, name)[0] || null) : (code ? here[0] : null);
+  }
+
+  // 「重复填满」的停止条件：现场量这条线还剩几个空槽位。
+  // 读不到线时返回 null（未知），调用方不能把未知当成满
+  function groupFreeSlots(g) {
+    var line = groupLine(g, allLines());
+    return line ? line.free : null;
+  }
+
+  // 读这条线已经排好的队列，拿最后一单的产品缩写回查计划里的位置。
+  // 返回 -1 表示「从头开始」，否则是「最后一单在组里的下标」，执行时从它下一条起
+  function resumeIndex(group) {
+    var lines = allLines();
+    if (!lines.length) return { idx: -1, why: '页面上没有打开的生产列表瓦片，从第一条开始' };
+    if (!group.line && !group.code) return { idx: -1, why: '这一组还没定生产线，从第一条开始' };
+    var line = groupLine(group, lines);
+    if (!line) return { idx: -1, why: '打开的生产列表里没有这一组（' + group.label +
+      '），从第一条开始；要续排先把那个 PROD 窗口开着' };
+    var orders = line.orders;
+    if (!orders.length) return { idx: -1, why: '线上没有订单（空槽位 ' + line.free + '），从第一条开始' };
+    var last = orders[orders.length - 1];
+    var tk = String(last.ticker || '').toUpperCase();
+    if (!tk) return { idx: -1, why: '线上最后一单读不出产物缩写，从第一条开始' };
+    var idx = -1;
+    group.entries.forEach(function (e, i) {
+      if (outTicker(e) === tk) idx = i;   // 计划里同产物出现多次时取最后一次，那就是走得更远的一处
+    });
+    if (idx < 0) return { idx: -1, why: '线上最后一单 ' + tk + ' 不在这组的计划里，从第一条开始' };
+    var next = idx + 1 < group.entries.length ? outTicker(group.entries[idx + 1]) || group.entries[idx + 1].label : '';
+    return {
+      idx: idx,
+      why: '线上最后一单 ' + tk + '（' + last.qty + ' ' + last.eta + '，' +
+        (last.queued ? '排队' : '进行中') + '）= 计划第 ' + (idx + 1) + '/' + group.entries.length + ' 条，' +
+        (next ? '从第 ' + (idx + 2) + ' 条 ' + next + ' 起续排' : '它已是本组最后一条，下一条回到组首')
+    };
   }
   function timeText(e) {
     if (!e.time_ms) return '耗时未知（本地模板没读到时长）';
     var one = orderMs(e);
     var n = orderCount(e);
     return '耗时 单件 ' + fmtMs(e.time_ms) + ' × 大小 ' + Math.max(1, e.size || 1) +
-      ' = 一单 ' + fmtMs(one) + (n > 1 ? ' × ' + n + ' 单 = ' + fmtMs(one * n) : '') +
+      ' = 一单 ' + fmtMs(one) +
+      (n === Infinity ? '（重复填满：下到该线队列满，总单数不固定）' :
+        (n > 1 ? ' × ' + n + ' 单 = ' + fmtMs(one * n) : '')) +
       '（' + (e.dur_src || 'API 口径') + '）';
   }
-  // 同一条生产线的订单只能首尾相接，不同线并行跑，所以给两个数
+  // 同一条生产线的订单只能首尾相接，不同线并行跑，所以给两个数。
+  // 勾了重复填满的条目单数不确定（下到队列满才停），不参与总时长
   function totalsText() {
     var sel = state.queue.filter(function (e) { return e.on; });
     if (!sel.length) return '';
     var perLine = {};
     var serial = 0;
     var known = 0;
+    var fill = 0;
     sel.forEach(function (e) {
-      var t = orderMs(e) * orderCount(e);
+      if (e.repeat) { fill++; return; }
+      var t = orderMs(e);
       if (!t) return;
       known++;
       serial += t;
-      var k = e.line || '自动';
+      var k = entryTag(e);
       perLine[k] = (perLine[k] || 0) + t;
     });
-    if (!known) return '';
-    var wall = Math.max.apply(null, Object.keys(perLine).map(function (k) { return perLine[k]; }));
-    return '选中 ' + sel.length + ' 条：串行相加 ' + fmtMs(serial) +
-      '，按线并行 ' + fmtMs(wall) + '（取最长的一条线）' +
-      (known < sel.length ? '，' + (sel.length - known) + ' 条无时长未计入' : '');
+    var bits = [];
+    if (known) {
+      var wall = Math.max.apply(null, Object.keys(perLine).map(function (k) { return perLine[k]; }));
+      bits.push('选中 ' + sel.length + ' 条：串行相加 ' + fmtMs(serial) +
+        '，按线并行 ' + fmtMs(wall) + '（取最长的一条线）');
+      var unknown = sel.length - known - fill;
+      if (unknown > 0) bits.push(unknown + ' 条无时长未计入');
+    }
+    if (fill) bits.push(fill + ' 条勾了重复填满，下到该线队列满为止，不计总时长');
+    return bits.join('；');
   }
 
   async function loadRecipes(force) {
@@ -259,12 +422,14 @@
   function exportName() {
     var planets = uniq(state.queue.map(locFor));
     var blds = uniq(state.queue.map(function (e) { return e.building; }));
+    var ids = uniq(state.queue.map(codeFor));
     var d = new Date();
     var p = function (n) { return (n < 10 ? '0' : '') + n; };
     var stamp = '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
     var safe = function (s) { return String(s).replace(/[<>:"/\\|?*]+/g, '_'); };
     return safe(planets.length === 1 ? planets[0] : planets.length ? '多星球' + planets.length : '未知星球') +
       '_' + safe(blds.length === 1 ? blds[0] : blds.length ? '多建筑' + blds.length : '未知建筑') +
+      '_' + safe(ids.length === 1 ? 'PROD' + ids[0] : ids.length ? '队列' + ids.length : '未定位') +
       '_' + stamp + '.json';
   }
 
@@ -276,8 +441,19 @@
     entry.on = true;
     state.queue.push(entry);
     saveQueue();
-    log('入队 [' + entry.building + '] ' + entry.label + ' -> ' + entry.line);
+    log('入队 [' + entry.building + '] ' + entry.label + ' -> ' + entryTag(entry));
     renderQueue();
+  }
+
+  // 导出/导入的线定位字段：queueId 就是游戏里那条队列的名字（`PROD bda98a38`），
+  // 光有中文线名不唯一——同名基地不止一个，执行时先认这个 id
+  function exportEntry(e) {
+    var out = JSON.parse(JSON.stringify(e));
+    var code = codeFor(e);
+    out.queueId = code ? 'PROD ' + code : '';
+    out.code = code;
+    out.loc = locFor(e);
+    return out;
   }
 
   // 导入的文件是外部输入，缺字段就把渲染队列时会读的那几个补上，其余原样保留
@@ -287,6 +463,8 @@
     e.label = e.label || e.sig;
     e.building = e.building || '?';
     e.line = e.line || '自动';
+    var qid = /\b([0-9a-f]{5,})\b/i.exec(String(e.queueId || ''));
+    e.code = e.code || (qid ? qid[1].toLowerCase() : '');
     e.time_ms = Number(e.time_ms) || 0;
     e.size = Math.max(1, Math.min(20, Number(e.size) || 1));
     e.repeatMax = Math.max(1, Math.min(50, Number(e.repeatMax) || 20));
@@ -312,13 +490,14 @@
   // 只能从 APEX 自己的模板列表入队
   function addTemplateToQueue(t) {
     pushEntry({
-      recipe_id: t.api ? t.api.recipe_id : 'line:' + t.line + ':' + t.sig,
+      recipe_id: t.api ? t.api.recipe_id : 'line:' + (t.code || t.line) + ':' + t.sig,
       label: t.label,
       sig: t.sig,
       building: t.api ? t.api.building_ticker : '本地/' + t.line,
       time_ms: t.time_ms,
       dur_src: 'APEX 实测',
-      line: t.line
+      line: t.line,
+      code: t.code || ''
     });
   }
 
@@ -344,25 +523,80 @@
     return (/([A-Z]{2,4}-\d{2,4}[a-z]?)/.exec(full) || [''])[0];
   }
 
+  // 基地自带一个内部编码：点开基地 FK-794B 的生产力，窗口标题是 `WF bda98a38`，
+  // 生产队列那条线就是 `PROD bda98a38`。同一星球上可以有几个同名基地，
+  // 显示名会撞车，这个码才是「这条线」的唯一标识
+  // 只认紧跟在码前面的 `PROD` / `WF` 标签，把它和码一起剥掉：
+  // 留下裸「PROD」的话，两条同名线的显示名会变成「水培农场 PROD#bda98a38」这种累赘写法
+  var LINE_CODE_RE = /\b(?:([0-9a-f]{5,})|(?:PROD|WF)\s+([0-9a-f]{5,}))\b/i;
+
+  // 从瓦片表头原文里拆出 显示名 和 内部码。内部码是一串纯十六进制，
+  // 所以整串必须全 hex；`BS-BS-531a` 这类站点码带连字符，不会被误认
+  function splitLineCode(raw) {
+    var s = String(raw || '').trim();
+    var m = LINE_CODE_RE.exec(s);
+    if (!m) return { name: s, code: '' };
+    var code = String(m[1] || m[2] || '').toLowerCase();
+    if (!/^[0-9a-f]{5,}$/.test(code)) return { name: s, code: '' };
+    return {
+      name: (s.slice(0, m.index) + ' ' + s.slice(m.index + m[0].length))
+        .replace(/\b(?:PROD|WF)\b/gi, ' ')
+        .replace(/\s+/g, ' ').trim(),
+      code: code
+    };
+  }
+
+  // 线上显示的定位串：有内部码就以码为主、名字为辅
+  function lineTag(line) {
+    return line.code ? line.code + '(' + line.name + ')' : line.name;
+  }
+
+  // 线名匹配：先要一模一样；对不上再忽略插件自己加的 `#2` / `#bda98a38` 这类后缀，
+  // 因为老队列条目里存的可能是加后缀之前（或编号规则变了之前）的写法
+  function matchNamed(list, name) {
+    var exact = list.filter(function (l) { return l.name === name; });
+    if (exact.length) return exact;
+    var key = String(name).replace(/#[0-9a-z]{1,}$/i, '');
+    return list.filter(function (l) { return String(l.name).replace(/#[0-9a-z]{1,}$/i, '') === key; });
+  }
+
   function uniq(list) {
     var out = [];
     list.forEach(function (v) { if (v && out.indexOf(v) < 0) out.push(v); });
     return out;
   }
 
+  // 报错时用的一句话：页面上现在开着哪些生产列表，各自有哪些线、在哪个星球
+  function openTilesDesc() {
+    var tiles = prodTiles().filter(tileVisible);
+    if (!tiles.length) return '一个都没打开';
+    var bits = tiles.slice(0, 6).map(function (t) {
+      var c = tileCode(t);
+      var hit = infoFor(c);
+      return (c ? 'PROD ' + c : '无码') + (hit && hit.loc ? '@' + hit.loc : '') +
+        '（' + listLines(t).map(function (l) { return l.name; }).join('/') + '）';
+    });
+    return bits.join(' / ') + (tiles.length > 6 ? ' …共 ' + tiles.length + ' 个瓦片' : '');
+  }
+
   async function scanLineTemplates() {
-    var tile = prodTile();
-    if (!tile) throw new Error('页面上找不到生产列表（PROD）瓦片，请先打开它');
-    var lines = listLines(tile);
+    var lines = allLines();
+    var tiles = prodTiles().filter(tileVisible);
+    if (!lines.length) throw new Error('页面上没有打开的生产列表（PROD）瓦片，请先打开它');
     var found = [];
-    log('扫描 ' + lines.length + ' 条生产线的模板：' + lines.map(function (l) { return l.name; }).join(' / '));
+    // 一开始就把当前这批队列 id 登进表：状态栏和文件名按表里的现查，
+    // 不然切星球后重扫，顶上那行还挂着上一个星球
+    harvestLines(lines);
+    log('扫描 ' + tiles.length + ' 个瓦片上的 ' + lines.length + ' 条生产线的模板：' +
+      lines.map(function (l) { return lineTag(l); }).join(' / '));
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i];
       var w = null;
+      var loc = '';
       try {
         var opened = await openOrderWindow(line);
         w = opened.w;
-        var loc = readLocation(opened.form);
+        loc = harvestLine(line, readLocation(opened.form));
         var opts = await readTemplateOptions(opened.form);
         opts.forEach(function (o) {
           var api = null;
@@ -371,16 +605,19 @@
           }
           if (api) state.lineMap[api.building_ticker] = line.name;
           found.push({
-            line: line.name, sig: o.sig, label: o.label, duration: o.duration,
+            line: line.name, code: line.code, sig: o.sig, label: o.label, duration: o.duration,
             time_ms: parseDurationMs(o.duration), loc: loc, api: api
           });
         });
-        log('  ' + line.name + (loc ? ' @ ' + loc : '') + '：' + opts.length + ' 个模板，其中 ' +
-          found.filter(function (f) { return f.line === line.name && f.api; }).length + ' 个能对上 API 配方');
+        log('  ' + lineTag(line) + (loc ? ' @' + loc : '') +
+          '：' + opts.length + ' 个模板，其中 ' +
+          found.filter(function (f) { return f.line === line.name && f.code === line.code && f.api; }).length +
+          ' 个能对上 API 配方');
         await closeWindow(w);
         w = null;
       } catch (e) {
-        log('  ' + line.name + ' 扫描失败：' + e.message);
+        harvestLine(line, loc);
+        log('  ' + lineTag(line) + ' 扫描失败：' + e.message);
       } finally {
         if (w) { try { await closeWindow(w); } catch (e2) { /* 已关闭 */ } }
       }
@@ -388,20 +625,42 @@
       await nextFrame();
     }
     lsSet('prun.linemap', state.lineMap);
+    // 扫描就是整片替换：列表只反映这次真正扫到的线，和 v0.2.0 一样。
+    // 现在「这次」= 页面上所有打开的瓦片，所以多星球同屏扫一遍就把它们全收进来了；
+    // 只想扫某一颗星球的话，把别的 PROD 窗口关掉再点
     state.scanned = found;
-    lsSet(K_SCANNED, found);
+    lsSet(K_SCANNED, state.scanned);
     log('已关联建筑→生产线：' + Object.keys(state.lineMap).map(function (k) { return k + '=' + state.lineMap[k]; }).join(' '));
     return found;
   }
 
   // ------------------------------------------------------ APEX DOM reading
 
-  function prodTile() {
-    var frames = byClass(document, 'TileFrame__frame');
-    for (var i = 0; i < frames.length; i++) {
-      if (/生产线/.test(text(one(frames[i], 'TileFrame__title')))) return frames[i];
-    }
-    return null;
+  function prodFrames() {
+    return byClass(document, 'TileFrame__frame').filter(function (f) {
+      return /生产线/.test(text(one(f, 'TileFrame__title')));
+    });
+  }
+
+  // 可以把多颗星球的生产列表同时摊在一个页面上，所以没有「当前瓦片」这种东西了：
+  // 取所有**可见**的生产列表瓦片，执行时按队列 id 在这些瓦片里找。
+  // APEX 的瓦片是缓存的：切星球后旧瓦片只是被隐藏、节点还留在文档里，
+  // 所以必须按可见性过滤，不然会把上一颗星球的线当成现在能下的
+  function prodTiles() {
+    var frames = prodFrames();
+    var visible = frames.filter(function (f) { return f.offsetWidth || f.offsetHeight; });
+    // 一个都不可见时退回第一个隐藏瓦片，只给状态栏和日志当证据用：
+    // 这时候执行会明确报「没有打开的生产列表」，不会拿隐藏的线真下单
+    return visible.length ? visible : frames.slice(0, 1);
+  }
+
+  function tileVisible(tile) {
+    return !!(tile.offsetWidth || tile.offsetHeight);
+  }
+
+  // 瓦片 cmd 行上的队列 id（`PROD bda98a38` 的 bda98a38），一个基地的整条队列共用它
+  function tileCode(tile) {
+    return splitLineCode(text(one(tile, 'TileFrame__cmd'))).code;
   }
 
   function parseMaterialIcons(tpl) {
@@ -424,52 +683,105 @@
     return f(parts.ins) + '=>' + f(parts.outs);
   }
 
+  // 空槽位也渲染成一个 OrderSlot__container，里面只有 `OrderTile__queue` 占位 div，
+  // 既没有游戏自己写的 data-prun-id，也没有材料缩写。实盘数过：二型预制件厂 22 个容器
+  // 只有 13 个真订单、三型 18/18（队列真满）、焊接棚 15/14。不过滤的话
+  // 「进行/队列」会把空位算成排队订单，槽位总数还恒定不变——下单后的变化检测就永远看不到新订单。
   function readOrders(col) {
-    if (!col) return [];
-    return byClass(col, 'OrderSlot__container').map(function (s) {
+    if (!col) return { orders: [], slots: 0 };
+    var all = byClass(col, 'OrderSlot__container');
+    var orders = [];
+    all.forEach(function (s) {
+      var id = s.getAttribute('data-prun-id') || '';
       var info = one(s, 'OrderSlot__info');
       var cells = info ? Array.prototype.map.call(info.children, text) : [];
       var iconBox = one(s, 'ColoredIcon__container');
-      return {
-        ticker: text(one(s, 'ColoredIcon__label')),
+      var ticker = text(one(s, 'ColoredIcon__label'));
+      if (!id && !ticker) return;
+      orders.push({
+        id: id,
+        ticker: ticker,
         name: iconBox ? iconBox.getAttribute('title') : '',
         qty: cells[0] || '',
         eta: cells[1] || '',
         status: text(one(s, 'OrderStatus__inProgress')) || cells[2] || '',
         queued: !!one(s, 'OrderTile__queue')
-      };
+      });
     });
+    return { orders: orders, slots: all.length };
   }
 
   function listLines(tile) {
     var grid = one(tile, 'SiteProductionLines__grid');
     if (!grid) return [];
+    // 实盘里 `PROD cb05ba60` 写在瓦片的 cmd 行上，一个基地的整条队列共用这一个码，
+    // 每条线的表头只有线名（农场 / 钻井）。所以线的身份是「瓦片码 + 线名」，
+    // 表头自己带码的写法仍然优先用表头的（老夹具和某些版本是那样排的）
+    var baseCode = tileCode(tile);
     var headers = Array.prototype.filter.call(grid.children, function (c) {
       return c.className.indexOf('header') >= 0;
     });
     var cols = Array.prototype.filter.call(grid.children, function (c) {
       return c.className.indexOf('column__') >= 0;
     });
-    return headers.map(function (h, i) {
-      var orders = readOrders(cols[i]);
+    var out = headers.map(function (h, i) {
+      var rd = readOrders(cols[i]);
+      var orders = rd.orders;
+      var raw = text(one(h, 'headerName'));
+      var p = splitLineCode(raw);
       return {
-        name: text(one(h, 'headerName')),
+        raw: raw,
+        // 表头整串只有 `PROD <码>` 时剥完是空的，留给下面的 BASE# 兜底，
+        // 这里不能用原文兜底，否则显示名又变回「PROD c0ffee01」这种没有信息量的写法
+        name: p.name,
+        code: p.code || baseCode,
+        tile: tile,
         header: h,
         orders: orders,
         active: orders.filter(function (o) { return !o.queued; }).length,
-        queued: orders.filter(function (o) { return o.queued; }).length
+        queued: orders.filter(function (o) { return o.queued; }).length,
+        // 容器总数减真订单数 = 还空着的槽位数。这是量出来的，不是游戏声明的容量
+        free: Math.max(0, rd.slots - orders.length)
       };
     });
+    out.forEach(function (l) {
+      // 表头整串就是 `PROD bda98a38` 时，剥掉码只剩「PROD」这种没有信息量的词，
+      // 拿基地编码顶上，免得显示名全一样、下拉框里分不清是哪条
+      if (!l.name || /^prod$/i.test(l.name)) l.name = l.code ? 'BASE#' + l.code : l.raw;
+    });
+    // 同一个基地里出现重名线时，光看名字分不开；队列 id 是整个基地共用的，追加它并不能
+    // 让两项变唯一，所以按出现次序编号：农场、农场#2、农场#3
+    var seen = {};
+    out.forEach(function (l) {
+      seen[l.name] = (seen[l.name] || 0) + 1;
+      if (seen[l.name] > 1) l.name = l.name + '#' + seen[l.name];
+    });
+    return out;
+  }
+
+  // 所有已打开（可见）生产列表瓦片上的全部生产线，每条线带着自己的 瓦片/表头 节点。
+  // 跨星球执行靠的就是这一张表：条目里的队列 id 落在哪个瓦片，就去哪个瓦片点新建订单
+  function allLines() {
+    var out = [];
+    prodTiles().forEach(function (t) {
+      if (!tileVisible(t)) return;
+      listLines(t).forEach(function (l) { out.push(l); });
+    });
+    return out;
   }
 
   // ---------------------------------------------------- order automation
 
-  // 该线订单槽位的占用签名；下单成功后它必然变化，用它替代下单后的固定等待
-  function lineLoad(name) {
-    var t = prodTile();
-    if (!t) return null;
-    var hit = listLines(t).filter(function (l) { return l.name === name; })[0];
-    return hit ? hit.orders.length * 100 + hit.queued : null;
+  // 该线订单槽位的占用签名；下单成功后它必然变化，用它替代下单后的固定等待。
+  // 队列 id 是整个基地共用的，所以必须 码 + 线名 一起比，只比码会拿基地里另一条线的槽位当自己
+  function lineLoad(line) {
+    var hit = allLines().filter(function (l) {
+      return (line.code ? l.code === line.code : l.name === line.name) && l.name === line.name;
+    })[0];
+    // 签名是订单 id 的集合，不是数量：空槽位不计入订单后容器总数恒定，
+    // 只比数量的话新订单填进空位时签名不变，下单后这一步就永远等不到证据
+    return hit ? hit.orders.map(function (o) { return o.id || (o.ticker + '|' + o.qty); })
+      .sort().join(',') : null;
   }
 
   function activeWindows() {
@@ -788,13 +1100,22 @@
       var btn = submitButton(form);
       if (!btn) throw new Error('找不到下单按钮');
       var ready = btn.className.indexOf('Button__disabled') < 0;
-      var block = ready ? null : describeBlock(form, size);
+      // 报受阻原因时带上量出来的槽位数：实盘里三型预制件厂 18 个容器全是真订单，
+      // 「无空位」就是它有证据的队列已满，不再只留一句「禁用原因未知」
+      var describe = function () {
+        var b = describeBlock(form, size);
+        var total = line.orders.length + (line.free || 0);
+        b.full = !!(total && !line.free);
+        b.detail += ' · 槽位 ' + line.orders.length + '/' + total + (b.full ? '（实测无空位）' : '');
+        return b;
+      };
+      var block = ready ? null : describe();
       if (!ready && entry.autoFit && block && block.reason === '库存不足' &&
           block.affordable >= 1 && block.affordable < size) {
         size = Math.min(block.affordable, 20);
         await setOrderSize(form, size, baseMs, unitSlack);
         ready = btn.className.indexOf('Button__disabled') < 0;
-        block = ready ? null : describeBlock(form, size);
+        block = ready ? null : describe();
         log('  自动降档 x' + sizeWanted + ' → x' + size);
       }
       var rng = readCostRange(form);
@@ -803,9 +1124,9 @@
       if (!ready) return { placed: false, ready: false, size: size, tpl: tpl, cost: cost, block: block };
       btn.click();
       // 等到「看得见的证据」：该线槽位变化，或对话框自己收起来。上限就是原来固定睡的 700ms
-      var load0 = lineLoad(line.name);
+      var load0 = lineLoad(line);
       await waitFor(function () {
-        return lineLoad(line.name) !== load0 ||
+        return lineLoad(line) !== load0 ||
           !document.body.contains(w) || !(w.offsetWidth || w.offsetHeight);
       }, 700, '订单入队').catch(function () { /* 证据没等到也只等满原来的 700ms */ });
       return { placed: true, ready: true, size: size, tpl: tpl, cost: cost, block: null };
@@ -816,51 +1137,174 @@
 
   // 一次只下一单。填不进（队列满 / 缺料）返回 placed:false，那不是错误，是轮转停止信号
   async function placeOnce(entry, opts) {
-    var tile = prodTile();
-    if (!tile) throw new Error('页面上找不到生产列表（PROD）瓦片，请先打开它');
-    var lines = listLines(tile);
+    var tiles = prodTiles().filter(tileVisible);
+    if (!tiles.length) throw new Error('页面上没有打开的生产列表（PROD）瓦片，先把要下的那条线所在的窗口打开');
+    var lines = allLines();
     if (!lines.length) throw new Error('生产列表里没有生产线');
 
-    var targets = entry.line && entry.line !== '自动'
-      ? lines.filter(function (l) { return l.name === entry.line; })
-      : lines;
-    if (!targets.length) throw new Error('找不到生产线「' + entry.line + '」，当前有：' + lines.map(function (l) { return l.name; }).join(' / '));
+    // 先认队列 id（`PROD bda98a38` 的那个 bda98a38）。实盘里它是**整个基地队列**的标识，
+    // 同一瓦片上的几条线共用一个码，所以定位是「码锁定基地 + 线名锁定这条线」。
+    // 码在哪就下哪：多颗星球的生产列表摊在同一页时，不需要先切到那条线的星球
+    var byCode = entry.code || '';
+    var byName = entry.line && entry.line !== '自动' ? entry.line : (state.lineMap[entry.building] || '');
+    var targets, wanted;
+    if (byCode) {
+      wanted = (byName ? byName + ' ' : '') + 'PROD ' + byCode;
+      var here = lines.filter(function (l) { return l.code === byCode; });
+      targets = byName ? matchNamed(here, byName) : here;
+      if (byName && here.length && !targets.length) {
+        throw new Error('队列 PROD ' + byCode + ' 已经打开了，但这个基地里没有线「' + byName +
+          '」，它有：' + here.map(lineTag).join(' / ') + '（重扫一次模板，线名跟着游戏里的改名走）');
+      }
+    } else {
+      // 「自动」不是真线名，配方页入队时线还没定；按 建筑→线 的关联去找，
+      // 找不到就把线挨个试（原有行为）。但试的范围只限第一个可见瓦片：
+      // 没有队列 id 就跨瓦片试线，等于把订单可能下进另一个基地，那是误操作
+      var local = listLines(tiles[0]);
+      wanted = byName;
+      targets = wanted ? matchNamed(local, byName) : local;
+    }
+    if (!targets.length) {
+      throw new Error('找不到生产队列「' + wanted + '」，当前打开的生产列表：' + openTilesDesc() +
+        (byCode ? '（没有 PROD ' + byCode + '；把那个窗口打开，或重扫一次模板拿最新的码）' : ''));
+    }
 
     var why = null;
+    var full = false;
     for (var i = 0; i < targets.length; i++) {
       var line = targets[i];
       try {
         var r = await attemptOnce(line, entry, opts, entry.size);
         var block = r.block ? r.block.reason + '：' + r.block.detail : '表单未就绪';
+        full = !!(r.block && r.block.full);
         if (opts.dryRun) {
           if (!r.ready) {
-            why = line.name + ' ' + block;
+            why = lineTag(line) + ' ' + block;
             log('  干跑受阻：' + why);
             continue;
           }
-          log('  干跑：' + line.name + ' ' + r.tpl.label + ' x' + r.size +
+          log('  干跑：' + lineTag(line) + ' ' + r.tpl.label + ' x' + r.size +
             '，表单耗时 ' + r.cost + '，已就绪未提交' +
-            (entry.repeat ? '；真实执行会轮转填满，上限 ' + (entry.repeatMax || 20) + ' 单' : ''));
+            (entry.repeat ? '；真实执行会一直轮转填满，直到这条线实测无空位' : ''));
           return { placed: false, dry: true };
         }
         if (!r.placed) {
-          why = line.name + ' ' + block;
-          log('  跳过 ' + line.name + '：' + block);
+          why = lineTag(line) + ' ' + block;
+          log('  跳过 ' + lineTag(line) + '：' + block);
           continue;
         }
-        log('  已下单 ' + line.name + ' x' + r.size + '（表单耗时 ' + r.cost + '）：' + r.tpl.label);
+        log('  已下单 ' + lineTag(line) + ' x' + r.size + '（表单耗时 ' + r.cost + '）：' + r.tpl.label);
         refreshStatus();
-        return { placed: true, size: r.size, line: line.name };
+        return { placed: true, size: r.size, line: line.name, code: line.code };
       } catch (e) {
         if (entry.line && entry.line !== '自动') throw e;
         why = e.message;
-        log('  ' + line.name + ' 跳过：' + e.message);
+        log('  ' + lineTag(line) + ' 跳过：' + e.message);
       }
     }
-    return { placed: false, reason: why || ('没有生产线能匹配 ' + entry.sig) };
+    return { placed: false, reason: why || ('没有生产线能匹配 ' + entry.sig), lineFull: full };
   }
 
-  // 多条一起勾选重复填满时按队列顺序轮转：一轮里每条各下一单，而不是一条灌满再换下一条
+  // 工厂之间依次做完一个再做下一个；同一工厂里的多条产物仍按轮转（一轮各下一单）。
+  // 每个工厂开工前先读它线上已经排好的队列，从最后一单之后续排。
+  async function runQueueInner(dryRun) {
+    var entries = state.queue.filter(function (e) { return e.on; });
+    if (!entries.length) { log('队列为空'); return; }
+    var groups = groupQueue(entries);
+    var fillN = entries.filter(function (e) { return e.repeat; }).length;
+    var fixedN = entries.length - fillN;
+    log('=== ' + (dryRun ? '干跑' : '真实下单') + '：' + groups.length + ' 个工厂 / ' +
+      entries.length + ' 条，计划 ' + fixedN + ' 单' +
+      (fillN ? ' + ' + fillN + ' 条填满（下到该线队列满）' : '') +
+      '；工厂依次完成，组内按队列顺序轮转 ===');
+    var acc = { placed: 0, ready: 0, rounds: 0, aborted: false };
+    for (var gi = 0; gi < groups.length; gi++) {
+      if (acc.aborted) break;
+      await runFactory(groups[gi], gi + 1, groups.length, dryRun, acc);
+    }
+    log('=== 结束：' + acc.rounds + ' 轮，' + groups.length + ' 个工厂，' +
+      (dryRun ? '可下 ' + acc.ready + ' / ' + entries.length + ' 条' : '成功 ' + acc.placed + ' 单') +
+      (acc.aborted ? '，出错中止' : '') + ' ===');
+    refreshStatus();
+  }
+
+  // 重复填满没有次数上限了，停止条件是「这条线实测无空位」。这个轮数纯粹是兜底，
+  // 防的是页面上读不到槽位、free 永远不是 0 的情况——一条线队列容量也就 20 上下
+  var MAX_ROUNDS = 60;
+
+  async function runFactory(g, gi, gn, dryRun, acc) {
+    var caps = g.entries.map(orderCount);        // 勾了重复填满 = Infinity
+    var done = g.entries.map(function () { return 0; });
+    var fills = caps.some(function (c) { return c === Infinity; });
+    log('【工厂 ' + gi + '/' + gn + '】' + g.label + '：' +
+      g.entries.map(function (e, i) { return (i + 1) + '.' + (outTicker(e) || e.label); }).join(' → '));
+    var start = 0;
+    if (state.resume) {
+      var r = resumeIndex(g);
+      log('  续排：' + r.why);
+      start = r.idx >= 0 ? (r.idx + 1) % g.entries.length : 0;
+      // 只有单次条目能按位置判定「这一条线上已经有了，本次不再下」。
+      // 勾了重复填满的条目不适用：它要下到队列满，位置不能替它决定配额——
+      // 上一版把命中位置之前的条目全按上限填满，于是线上最后一单恰好是组里最后一条时
+      // 整组被当成已完成，多产物的厂子一单都不下
+      for (var i = 0; i <= r.idx; i++) if (caps[i] !== Infinity) done[i] = caps[i];
+      if (!caps.some(function (c, i) { return done[i] < c; })) {
+        log('  这一组的单次条目都已排在线上，跳过');
+        return;
+      }
+    } else {
+      log('  续排：已关闭，从第一条开始');
+    }
+    var round = 0;
+    for (;;) {
+      var pending = caps.filter(function (c, i) { return done[i] < c; }).length;
+      if (!pending) break;
+      round++;
+      if (round > MAX_ROUNDS) { log('  已到 ' + MAX_ROUNDS + ' 轮兜底上限，这一家收工'); break; }
+      if (fills) {
+        // 开新一轮前先量一次这条线的空槽位：满了就别再一张张开对话框了
+        var free = groupFreeSlots(g);
+        if (free === 0) { log('  这条线实测无空位，' + g.label + ' 收工'); break; }
+      }
+      acc.rounds++;
+      var lineFull = false;
+      for (var k = 0; k < g.entries.length; k++) {
+        var j = (start + k) % g.entries.length;
+        if (done[j] >= caps[j]) continue;
+        var e = g.entries[j];
+        log('[工厂' + gi + ' 第' + round + '轮 ' + (j + 1) + '/' + g.entries.length + '] ' +
+          e.building + ' ' + e.label + ' x' + e.size + ' -> ' + entryTag(e) +
+          '（第 ' + (done[j] + 1) + (caps[j] === Infinity ? ' 单，该线还有空位' : '/' + caps[j]) + '）');
+        var res = null;
+        try {
+          res = await placeOnce(e, { dryRun: dryRun });
+        } catch (err) {
+          log('  失败：' + err.message);
+          if (!dryRun) {
+            log('真实下单出错即中止，避免继续误操作');
+            acc.aborted = true;
+            break;
+          }
+        }
+        if (dryRun) {
+          if (res && res.dry) acc.ready++;
+          done[j] = caps[j];
+          continue;
+        }
+        if (res.placed) { done[j]++; acc.placed++; continue; }
+        done[j] = caps[j];
+        log('  「' + e.label + '」停止续填：' + (res.reason || '未成功'));
+        if (res.lineFull) {
+          // 队列满是这条线的属性，不是这个产物的：一家厂里剩下的条目同样下不进去
+          log('  这条线队列已满，' + g.label + ' 收工');
+          lineFull = true;
+          break;
+        }
+      }
+      if (lineFull || acc.aborted || dryRun) break;
+      await nextFrame();
+    }
+  }
   async function runQueue(dryRun) {
     if (running) { log('已在执行中，忽略本次触发'); return; }
     running = true;
@@ -871,50 +1315,6 @@
       running = false;
       syncRunBtn();
     }
-  }
-
-  async function runQueueInner(dryRun) {
-    var entries = state.queue.filter(function (e) { return e.on; });
-    if (!entries.length) { log('队列为空'); return; }
-    var caps = entries.map(function (e) { return orderCount(e); });
-    var done = entries.map(function () { return 0; });
-    var plan = caps.reduce(function (s, c) { return s + c; }, 0);
-    log('=== ' + (dryRun ? '干跑' : '真实下单') + '：' + entries.length + ' 条，按队列顺序轮转，计划 ' + plan + ' 单 ===');
-    var round = 0, placed = 0, ready = 0, aborted = false;
-    for (;;) {
-      var pending = caps.filter(function (c, i) { return done[i] < c; }).length;
-      if (!pending) break;
-      round++;
-      for (var i = 0; i < entries.length; i++) {
-        if (done[i] >= caps[i]) continue;
-        var e = entries[i];
-        log('[第' + round + '轮 ' + (i + 1) + '/' + entries.length + '] ' + e.building + ' ' + e.label +
-          ' x' + e.size + ' -> ' + e.line + '（' + (done[i] + 1) + '/' + caps[i] + '）');
-        var res = null;
-        try {
-          res = await placeOnce(e, { dryRun: dryRun });
-        } catch (err) {
-          log('  失败：' + err.message);
-          if (!dryRun) { log('真实下单出错即中止，避免继续误操作'); aborted = true; break; }
-        }
-        if (dryRun) {
-          if (res && res.dry) ready++;
-          done[i] = caps[i];
-          continue;
-        }
-        if (res.placed) { done[i]++; placed++; }
-        else {
-          done[i] = caps[i];
-          log('  「' + e.label + '」停止续填：' + (res.reason || '未成功'));
-        }
-      }
-      if (aborted || dryRun) break;
-      await nextFrame();
-    }
-    log('=== 结束：' + round + ' 轮，' +
-      (dryRun ? '可下 ' + ready + ' / ' + entries.length + ' 条' : '成功 ' + placed + ' 单') +
-      (aborted ? '，出错中止' : '') + ' ===');
-    refreshStatus();
   }
 
   // ---------------------------------------------------------------- UI
@@ -945,22 +1345,41 @@
     }
   }
 
+  // 顶部那一行现在是「开着哪些生产列表」的全景，不再只有第一个瓦片：
+  // 多星球同屏执行时，这一行就是判断「目标队列 id 到底开没开」的依据
   function refreshStatus() {
     if (!refs.status) return;
-    var locs = uniq(state.scanned.map(function (t) { return t.loc; }));
-    var where = locs.length ? '星球 ' + locs.join(' / ') : '未扫描，不知道星球';
-    var tile = prodTile();
-    if (!tile) { refs.status.textContent = where + ' · 未找到生产列表瓦片'; return; }
-    refs.status.textContent = where + ' · ' + text(one(tile, 'TileFrame__cmd')) + ' · ' +
-      listLines(tile).map(function (l) {
-        return l.name + '（进行' + l.active + '/队列' + l.queued + '）';
-      }).join('，');
+    var tiles = prodTiles().filter(tileVisible);
+    if (!tiles.length) {
+      var locs = uniq(state.scanned.map(function (t) { return t.loc; }));
+      refs.status.textContent = (locs.length ? '星球 ' + locs.join(' / ') : '未扫描，不知道星球') +
+        ' · 未找到打开的生产列表瓦片';
+      refs.status.title = refs.status.textContent;
+      return;
+    }
+    var parts = [];
+    var allLocs = [];
+    tiles.forEach(function (tile) {
+      var lines = listLines(tile);
+      harvestLines(lines);
+      var locs = uniq(lines.map(locOfLine));
+      allLocs = allLocs.concat(locs);
+      var cmd = text(one(tile, 'TileFrame__cmd'));
+      parts.push((cmd || 'PROD ?') + (locs.length ? ' @' + locs.join('/') : ' @未扫描') + ' ' +
+        lines.map(function (l) { return lineInfoText(l) + '（进行' + l.active + '/队列' + l.queued + '/空' + l.free + '）'; }).join('，'));
+    });
+    refs.status.textContent = '打开 ' + tiles.length + ' 个生产列表 · 星球 ' +
+      (allLocs.length ? uniq(allLocs).join(' / ') : '未扫描，点「扫描生产线模板」') +
+      ' · ' + parts.join(' ｜ ');
+    refs.status.title = refs.status.textContent;
   }
 
+  // 队列行下拉框的数据源：显示名 + 队列 id + 星球码（星球码只有扫过才有）。
+  // 把所有打开瓦片上的线并进来，多星球同屏时直接在下拉里选另一颗星球的那条线
   function lineNames() {
-    var tile = prodTile();
-    if (!tile) return [];
-    return listLines(tile).map(function (l) { return l.name; });
+    return allLines().map(function (l) {
+      return { name: l.name, code: l.code, loc: locOfLine(l) };
+    });
   }
 
   // 样式必须在入口挂载时就注入：侧边标签自己没有样式的话，会退化成贴满页面宽度的块
@@ -972,8 +1391,12 @@
       '#prun-panel{position:fixed;right:48px;top:64px;width:470px;max-height:82vh;display:flex;flex-direction:column;',
       'z-index:2147483000;background:#12161d;color:#d6dde8;border:1px solid #2f3a49;border-radius:8px;',
       'font:12px/1.5 system-ui,"Microsoft YaHei",sans-serif;box-shadow:0 8px 28px rgba(0,0,0,.55)}',
-      '#prun-panel header{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #2f3a49;cursor:move}',
+      '#prun-panel header{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:8px 10px;border-bottom:1px solid #2f3a49;cursor:move}',
       '#prun-panel header b{font-size:13px}',
+      // 多颗星球的生产列表同屏时顶部那行会很长：让它换行整幅占位，不要撑破面板
+      '#prun-panel header .dim{order:3;flex:1 1 100%;min-width:0;font-size:11px;line-height:1.4;word-break:break-all}',
+      // 关闭按钮留在标题那一行，状态那行独占下面一整行
+      '#prun-panel header span:last-child{order:2}',
       '#prun-panel .tabs{display:flex;gap:4px;padding:6px 10px;border-bottom:1px solid #2f3a49}',
       '#prun-panel .tabs button{background:#1b222c;color:#aeb9c8;border:1px solid #2f3a49;border-radius:4px;padding:3px 10px;cursor:pointer}',
       '#prun-panel .tabs button.on{background:#2d6cdf;color:#fff;border-color:#2d6cdf}',
@@ -988,6 +1411,10 @@
       '#prun-panel .qbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:4px}',
       '#prun-panel .plan{color:#8fb2e6;margin-top:3px;word-break:break-all}',
       '#prun-panel .qtotal{padding:6px 0 2px;border-top:1px solid #2b3648;color:#c9d6e8}',
+      '#prun-panel .qgroup{margin-top:8px;padding:4px 6px;background:#161d27;border-left:3px solid #2f6f5e;border-radius:3px}',
+      '#prun-panel .qgtitle{display:flex;flex-wrap:wrap;gap:4px;align-items:baseline;color:#c9d6e8;word-break:break-all}',
+      '#prun-panel .qgroup .row{margin-top:3px}',
+      '#prun-panel .qgitem{border-left:3px solid #2f6f5e;padding-left:6px}',
       '#prun-panel details{border-bottom:1px solid #1d2531;padding:3px 0}',
       '#prun-panel summary{cursor:pointer;color:#8fb2e6;font-weight:600;padding:2px 0}',
       '#prun-panel details>.qitem{border-bottom:0;padding-left:12px}',
@@ -1168,9 +1595,13 @@
       all.value = '';
       sel.appendChild(all);
       var seen = {};
-      state.scanned.forEach(function (t) { if (!seen[t.line]) seen[t.line] = t.loc || ''; });
+      state.scanned.forEach(function (t) {
+        var k = seen[t.line] || (seen[t.line] = { loc: '', code: '' });
+        if (t.loc) k.loc = t.loc;
+        if (t.code) k.code = t.code;
+      });
       Object.keys(seen).sort().forEach(function (n) {
-        var o = el('option', null, n + (seen[n] ? ' @ ' + seen[n] : ''));
+        var o = el('option', null, n + (seen[n].loc ? ' @ ' + seen[n].loc : '') + (seen[n].code ? ' PROD ' + seen[n].code : ''));
         o.value = n;
         sel.appendChild(o);
       });
@@ -1199,7 +1630,8 @@
       if (grouped) {
         var box = document.createElement('details');
         box.open = !!state.tplOpen[k];
-        var sum = el('summary', null, k + (rows[0].loc ? ' @ ' + rows[0].loc : '') + '（' + rows.length + ' 个）');
+        var sum = el('summary', null, k + (rows[0].code ? ' PROD ' + rows[0].code : '') +
+          (rows[0].loc ? ' @ ' + rows[0].loc : '') + '（' + rows.length + ' 个）');
         box.appendChild(sum);
         box.addEventListener('toggle', function () {
           state.tplOpen[k] = box.open;
@@ -1219,7 +1651,8 @@
     var txt = el('div', 'txt');
     txt.appendChild(el('b', null, (hideLine ? '' : t.line + ' ') + t.label));
     txt.appendChild(el('div', 'dim', t.sig + ' · ' + t.duration +
-      (t.loc ? ' · ' + t.loc : '') + (t.api ? ' · ' + t.api.building_ticker : ' · API 无此配方')));
+      (t.code ? ' · PROD ' + t.code : '') + (t.loc ? ' @ ' + t.loc : '') +
+      (t.api ? ' · ' + t.api.building_ticker : ' · API 无此配方')));
     top.appendChild(txt);
     var b = el('button', 'act', '入队');
     b.onclick = function () { addTemplateToQueue(t); };
@@ -1259,8 +1692,12 @@
         renderTemplates();
         log('扫描完成：' + found.length + ' 个模板');
         renderRecipes();
+        renderQueue();
+        // 顶部的星球/队列 id 行要跟着这次扫描重算，不能停在上一颗星球
+        refreshStatus();
       }).catch(function (e) {
         log('扫描失败：' + e.message);
+        refreshStatus();
       }).then(function () { scan.disabled = false; });
     };
     var bar = el('div', 'row');
@@ -1269,7 +1706,7 @@
       if (!state.queue.length) { log('队列是空的，没什么可导出'); return; }
       var name = exportName();
       try {
-        var url = URL.createObjectURL(new Blob([JSON.stringify(state.queue, null, 2)], { type: 'application/json' }));
+        var url = URL.createObjectURL(new Blob([JSON.stringify(state.queue.map(exportEntry), null, 2)], { type: 'application/json' }));
         var a = el('a');
         a.href = url;
         a.download = name;
@@ -1300,8 +1737,20 @@
         if (!window.confirm('导入 ' + list.length + ' 条，替换当前 ' + state.queue.length + ' 条队列？')) return;
         state.queue = list;
         saveQueue();
+        // 档里带着队列 id 和星球码，顺手并进登记表，换电脑/换浏览器导入后状态栏就认识这些线
+        var regChanged = false;
+        list.forEach(function (e) {
+          if (!e.code) return;
+          var rec = state.lines[e.code] || (state.lines[e.code] = {});
+          if (e.line && !rec.name) { rec.name = e.line.replace(/#[0-9a-f]{5,}$/i, ''); }
+          if (e.loc && rec.loc !== e.loc) { rec.loc = e.loc; regChanged = true; }
+        });
+        if (regChanged) lsSet(K_LINES, state.lines);
         renderQueue();
-        log('从 ' + f.name + ' 导入 ' + list.length + ' 条');
+        refreshStatus();
+        var ids = uniq(list.map(codeFor));
+        log('从 ' + f.name + ' 导入 ' + list.length + ' 条' +
+          (ids.length ? '，队列 id ' + ids.map(function (c) { return 'PROD ' + c; }).join('/') : '（没有队列 id，按线名执行）'));
       }).catch(function (e) { log('导入失败：' + e.message); });
     };
     imp.onclick = function () { file.click(); };
@@ -1315,14 +1764,34 @@
     bar.appendChild(clr);
     root.appendChild(bar);
 
-    root.appendChild(el('div', 'dim', '↓ 队列：执行时按从上到下轮转，一轮里每条勾选的各下一单'));
+    root.appendChild(el('div', 'dim',
+      '↓ 队列按「工厂」分组：执行时做完一家再做下一家，同一厂里的多条产物按组内顺序轮转；勾了「重复填满」的没有次数上限，下到这条线实测无空位为止。'));
+
+    // 续排开关：默认开——执行前先读这条线已经排好的队列，从最后一单之后接着排
+    var rr = el('div', 'row');
+    var resume = el('input');
+    resume.type = 'checkbox';
+    resume.checked = state.resume !== false;
+    var rlabel = el('label', 'dim');
+    rlabel.title = '关掉就每次从队列第一条开始排，不看线上已经排了什么';
+    rlabel.appendChild(resume);
+    rlabel.appendChild(document.createTextNode(' 执行前读取线上队列，从最后一单之后续排'));
+    rr.appendChild(rlabel);
+    resume.onchange = function () {
+      state.resume = resume.checked;
+      lsSet(K_RESUME, state.resume);
+      log('续排：' + (state.resume ? '开（先读线上队列再决定从哪条起）' : '关（每次从第一条开始）'));
+      renderQueue();
+    };
+    root.appendChild(rr);
+
     refs.queueList = el('div');
     root.appendChild(refs.queueList);
 
     // 排好队直接在这一页点执行；是否干跑在执行页配置，这里不弹任何确认
     var sep = el('div', 'dim');
     sep.style.cssText = 'padding-top:6px;border-top:1px solid #2f3a49';
-    sep.textContent = '↓ 执行：按上方队列顺序轮转；是否干跑在「执行」页配置（默认不干跑）';
+    sep.textContent = '↓ 执行：一个工厂一个工厂做完（组内轮转）；是否干跑在「执行」页配置（默认不干跑）';
     root.appendChild(sep);
     var rrow = el('div', 'row');
     refs.run = el('button', 'act', '执行队列');
@@ -1343,8 +1812,66 @@
     var names = lineNames();
     var total = el('div', 'dim qtotal');
     function syncTotals() { total.textContent = totalsText(); }
-    state.queue.forEach(function (e, idx) {
-      var item = el('div', 'qitem');
+
+    // 组内上下移动：只在本厂的条目之间换位，不会把订单挪到别的工厂去
+    function moveWithin(e, dir) {
+      var idx = state.queue.indexOf(e);
+      var k = groupKey(e);
+      var j = idx;
+      for (;;) {
+        var n = j + dir;
+        if (n < 0 || n >= state.queue.length) return;   // 这一头已经是本厂的第一/最后一条
+        j = n;
+        if (groupKey(state.queue[j]) === k) break;      // 中间夹着的别的厂的条目越过不管
+      }
+      var list = state.queue.slice();
+      list.splice(idx, 1);
+      var at = j > idx ? j - 1 : j;
+      list.splice(at + (dir > 0 ? 1 : 0), 0, e);
+      state.queue = list;
+      saveQueue();
+      renderQueue();
+    }
+    // 整组换位：把这一家的所有条目挪到相邻那一家前面/后面，顺带把交叉的条目归拢成连续
+    function moveGroup(from, dir) {
+      var groups = groupQueue(state.queue);
+      var to = from + dir;
+      if (to < 0 || to >= groups.length) return;
+      var order = groups.map(function (g) { return g.entries; });
+      var tmp = order[from];
+      order[from] = order[to];
+      order[to] = tmp;
+      state.queue = [];
+      order.forEach(function (list) { state.queue = state.queue.concat(list); });
+      saveQueue();
+      renderQueue();
+    }
+
+    var groups = groupQueue(state.queue);
+    groups.forEach(function (g, gIdx) {
+      var head = el('div', 'qgroup');
+      var ht = el('div', 'qgtitle');
+      ht.appendChild(el('b', null, (gIdx + 1) + '. ' + g.label));
+      ht.appendChild(el('span', 'dim', '　' + g.entries.length + ' 条产物：' +
+        g.entries.map(function (e, i) { return (i + 1) + '.' + (outTicker(e) || e.label); }).join(' → ')));
+      head.appendChild(ht);
+      var gbtns = el('div', 'row');
+      var gu = el('button', null, '↑ 整组');
+      gu.title = '把这个工厂整组前移，执行时就更早开工';
+      gu.onclick = function () { moveGroup(gIdx, -1); };
+      var gd = el('button', null, '↓ 整组');
+      gd.title = '把这个工厂整组后移';
+      gd.onclick = function () { moveGroup(gIdx, 1); };
+      gbtns.appendChild(gu);
+      gbtns.appendChild(gd);
+      head.appendChild(gbtns);
+      refs.queueList.appendChild(head);
+      g.entries.forEach(function (e, i) { renderItem(e, i + 1); });
+    });
+
+    function renderItem(e, seq) {
+      var idx = state.queue.indexOf(e);
+      var item = el('div', 'qitem qgitem');
 
       var top = el('div', 'qtop');
       var on = el('input');
@@ -1354,7 +1881,7 @@
       on.onchange = function () { e.on = on.checked; saveQueue(); sync(); };
       top.appendChild(on);
       var txt = el('div', 'txt');
-      txt.appendChild(el('b', null, e.building + ' ' + e.label));
+      txt.appendChild(el('b', null, seq + '. ' + e.building + ' ' + e.label));
       txt.appendChild(el('div', 'dim', e.sig + ' · ' + fmtMs(e.time_ms)));
       top.appendChild(txt);
       item.appendChild(top);
@@ -1363,17 +1890,32 @@
       bar.appendChild(el('span', 'dim', '生产线'));
 
       var sel = el('select');
-      var opts = ['自动'].concat(names);
+      var lineLabel = function (l) {
+        return l.name + (l.code ? ' PROD ' + l.code : '') + (l.loc ? ' @ ' + l.loc : '');
+      };
+      // 多个瓦片同屏后光靠线名不唯一了（两颗星球各有一个「农场」），
+      // 下拉框的取值必须是 线名@队列 id 这个组合键
+      var lineKey = function (l) { return l.code ? l.name + '@' + l.code : l.name; };
+      var opts = [{ name: '自动', code: '', loc: '' }].concat(names);
+      var want = lineKey({ name: e.line, code: e.code });
       // 生产列表瓦片没打开时 lineNames() 为空，不能因此把用户选定的生产线抹掉
-      if (opts.indexOf(e.line) < 0 && e.line && e.line !== '自动') opts.push(e.line);
-      opts.forEach(function (n) {
-        var o = el('option', null, n);
-        o.value = n;
+      if (!opts.some(function (l) { return lineKey(l) === want; }) && e.line && e.line !== '自动') {
+        opts.push({ name: e.line, code: e.code || '', loc: '' });
+      }
+      opts.forEach(function (l) {
+        var o = el('option', null, lineLabel(l));
+        o.value = lineKey(l);
         sel.appendChild(o);
       });
-      sel.value = e.line;
-      if (sel.value !== e.line) { sel.value = '自动'; e.line = '自动'; }
-      sel.onchange = function () { e.line = sel.value; saveQueue(); sync(); };
+      sel.value = want;
+      if (sel.value !== want) { sel.value = '自动'; e.line = '自动'; e.code = ''; }
+      sel.onchange = function () {
+        var hit = opts.filter(function (l) { return lineKey(l) === sel.value; })[0];
+        e.line = hit ? hit.name : sel.value;
+        e.code = hit ? hit.code : '';
+        saveQueue();
+        sync();
+      };
       bar.appendChild(sel);
 
       bar.appendChild(el('span', 'dim', '大小'));
@@ -1392,24 +1934,8 @@
       };
       bar.appendChild(size);
 
-      bar.appendChild(el('span', 'dim', '上限'));
-      var max = el('input');
-      max.type = 'number';
-      max.min = '1';
-      max.max = '50';
-      max.value = e.repeatMax || 20;
-      max.style.width = '42px';
-      max.title = '重复模式下的最大下单次数';
-      max.onchange = function () {
-        e.repeatMax = Math.max(1, Math.min(50, Number(max.value) || 20));
-        max.value = e.repeatMax;
-        saveQueue();
-        sync();
-      };
-      bar.appendChild(max);
-
       var rep = el('label', 'dim');
-      rep.title = '勾选后执行时按队列顺序轮转下单：一轮里每条勾选的各下一单，直到该线队列满、库存不足或达到上限';
+      rep.title = '勾选后执行时在本厂内按组内顺序轮转下单：一轮里每条勾选的各下一单，一直下到这条线实测无空位（或库存不足）为止；不再看次数上限';
       var repc = el('input');
       repc.type = 'checkbox';
       repc.checked = !!e.repeat;
@@ -1438,18 +1964,12 @@
       sync();
 
       var up = el('button', null, '↑');
-      up.onclick = function () {
-        if (idx === 0) return;
-        state.queue.splice(idx - 1, 0, state.queue.splice(idx, 1)[0]);
-        saveQueue(); renderQueue();
-      };
+      up.title = '在本厂内前移一位（不会挪到别的工厂去）';
+      up.onclick = function () { moveWithin(e, -1); };
       bar.appendChild(up);
       var dn = el('button', null, '↓');
-      dn.onclick = function () {
-        if (idx >= state.queue.length - 1) return;
-        state.queue.splice(idx + 1, 0, state.queue.splice(idx, 1)[0]);
-        saveQueue(); renderQueue();
-      };
+      dn.title = '在本厂内后移一位';
+      dn.onclick = function () { moveWithin(e, 1); };
       bar.appendChild(dn);
       var rm = el('button', null, '删');
       rm.onclick = function () {
@@ -1462,7 +1982,7 @@
       item.appendChild(time);
 
       refs.queueList.appendChild(item);
-    });
+    }
     syncTotals();
     refs.queueList.appendChild(total);
   }
@@ -1488,12 +2008,20 @@
     var r2 = el('div', 'row');
     var stat = el('button', null, '读取当前队列');
     stat.onclick = function () {
-      var tile = prodTile();
-      if (!tile) { log('找不到生产列表瓦片'); return; }
-      listLines(tile).forEach(function (l) {
-        log(l.name + '：进行 ' + l.active + '，队列 ' + l.queued);
-        l.orders.slice(0, 5).forEach(function (o) {
-          log('  ' + (o.queued ? '[队列]' : '[进行]') + ' ' + o.ticker + ' ' + o.name + ' ' + o.qty + ' ' + o.eta + ' ' + o.status);
+      var tiles = prodTiles().filter(tileVisible);
+      if (!tiles.length) { log('没有打开的生产列表瓦片'); return; }
+      log('页面上打开着 ' + tiles.length + ' 个生产列表');
+      tiles.forEach(function (tile) {
+        var lines = listLines(tile);
+        var locs = uniq(lines.map(locOfLine));
+        log('【' + (text(one(tile, 'TileFrame__cmd')) || 'PROD ?') +
+          (locs.length ? ' @' + locs.join('/') : '') + '】');
+        lines.forEach(function (l) {
+          log('  ' + l.name + '：进行 ' + l.active + '，队列 ' + l.queued + '，空槽位 ' + l.free);
+          l.orders.slice(0, 8).forEach(function (o) {
+            log('    ' + (o.queued ? '[队列]' : '[进行]') + ' ' + o.ticker + ' ' + o.name + ' ' + o.qty + ' ' + o.eta + ' ' + o.status);
+          });
+          if (l.orders.length > 8) log('    …还有 ' + (l.orders.length - 8) + ' 单未列出');
         });
       });
       refreshStatus();
@@ -1580,4 +2108,21 @@
 
   // 顶栏可能延迟渲染，等 body 稳定后再挂入口
   waitFor(function () { return document.body; }, 5000).then(addTrigger, addTrigger);
+
+  // 面板开着的时候切星球、开/关生产列表窗口，游戏不通知任何人：
+  // 靠一个只看瓦片指纹的轮询发现变化，变了就重算顶部那行星球/队列 id。
+  // 指纹要覆盖**所有**打开的瓦片，多星球同屏时关掉其中一个也算变化
+  var lastSig = '';
+  setInterval(function () {
+    if (!refs.status || !panel || !document.body.contains(panel)) return;
+    if (panel.classList.contains('prun-hide')) return;
+    if (running) return;
+    var sig = prodTiles().filter(tileVisible).map(function (t) {
+      var lines = listLines(t);
+      return (tileCode(t) || '?') + ':' + lines.map(function (l) { return l.name + ':' + l.active + '/' + l.queued; }).join(',');
+    }).join('|') || 'none';
+    if (sig === lastSig) return;
+    lastSig = sig;
+    refreshStatus();
+  }, 2500);
 })();
