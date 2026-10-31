@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "PRUN 生产队列面板",
-  "version": "0.4.0",
-  "description": "在 APEX 里自定义生产队列，用 prunplanner 配方一键批量下单（执行页可切干跑）",
+  "version": "0.5.0",
+  "description": "在 APEX 里自定义生产队列，扫描模板或导入 JSON 后一键批量下单（执行页可切干跑）",
   "content_scripts": [
     {
       "matches": ["https://apex.prosperousuniverse.com/*"],

@@ -99,8 +99,6 @@
     scanned: lsGet(K_SCANNED, []),
     lines: lsGet(K_LINES, {}),
     lineMap: lsGet('prun.linemap', {}),
-    filterOut: '',
-    filterTicker: '',
     tplOut: '',
     tplLine: '',
     tplOpen: lsGet(K_TPLGROUP, {}),
@@ -130,11 +128,6 @@
     if (m) out.push(m + '分');
     if (!out.length) out.push('<1分');
     return out.join(' ');
-  }
-  function recipeLabel(r) {
-    var o = (r.outputs || []).map(function (i) { return i.material_ticker + i.material_amount; }).join(' ') || '空';
-    var i = (r.inputs || []).map(function (i2) { return i2.material_ticker + i2.material_amount; }).join(' ') || '无';
-    return i + ' => ' + o;
   }
 
   // 基地码优先取条目上存的，没存过（老队列、旧导入档）才按线名回查扫描结果
@@ -367,40 +360,12 @@
     log('配方已更新：' + list.length + ' 条');
   }
 
-  function tickers() {
-    var set = {};
-    state.recipes.forEach(function (r) { set[r.building_ticker] = 1; });
-    return Object.keys(set).sort();
-  }
-
-  // 模板/配方的产物 ticker 集合，搜索只按英文缩写筛，不看中文名
+  // 模板的产物 ticker 集合，搜索只按英文缩写筛，不看中文名
   function sigOutputs(sig) {
     var right = String(sig || '').split('=>')[1] || '';
     return right.split('+').filter(Boolean).map(function (p) {
       return p.replace(/x[\d.]+$/, '').toUpperCase();
     });
-  }
-  function recipeOutTickers(r) {
-    return (r.outputs || []).map(function (o) { return o.material_ticker.toUpperCase(); });
-  }
-
-  function matchesOutput(r, q) {
-    if (!q) return true;
-    var u = q.toUpperCase();
-    return recipeOutTickers(r).some(function (t) { return t.indexOf(u) >= 0; });
-  }
-
-  function filteredRecipes() {
-    var oq = state.filterOut.toUpperCase();
-    var bt = state.filterTicker;
-    var out = [];
-    for (var i = 0; i < state.recipes.length && out.length < 250; i++) {
-      var r = state.recipes[i];
-      if (bt && r.building_ticker !== bt) continue;
-      if (!matchesOutput(r, oq)) continue;
-      out.push(r);
-    }
-    return out;
   }
 
   function filteredScanned() {
@@ -472,18 +437,6 @@
     e.on = e.on !== false;
     e.autoFit = e.autoFit !== false;
     return e;
-  }
-
-  function addToQueue(r) {
-    pushEntry({
-      recipe_id: r.recipe_id,
-      label: recipeLabel(r),
-      sig: r._sig || recipeSig(r),
-      building: r.building_ticker,
-      time_ms: r.time_ms,
-      dur_src: 'API 口径',
-      line: '自动'
-    });
   }
 
   // 抽取类生产线（钻井等）的产物由星球资源决定，prunplanner 配方表里是空的，
@@ -1157,7 +1110,7 @@
           '」，它有：' + here.map(lineTag).join(' / ') + '（重扫一次模板，线名跟着游戏里的改名走）');
       }
     } else {
-      // 「自动」不是真线名，配方页入队时线还没定；按 建筑→线 的关联去找，
+      // 「自动」不是真线名，导入的档里线还没定；按 建筑→线 的关联去找，
       // 找不到就把线挨个试（原有行为）。但试的范围只限第一个可见瓦片：
       // 没有队列 id 就跨瓦片试线，等于把订单可能下进另一个基地，那是误操作
       var local = listLines(tiles[0]);
@@ -1324,7 +1277,7 @@
   var realRun = false;
   var running = false;
 
-  // 队列页底部的执行按钮：模式来自执行页的干跑开关（默认不干跑），这里只复述当前档位
+  // 队列页顶部那排按钮里的执行按钮：模式来自执行页的干跑开关（默认不干跑），这里只复述当前档位
   function syncRunBtn() {
     if (!refs.run) return;
     refs.run.textContent = running
@@ -1448,7 +1401,7 @@
 
     var tabs = el('div', 'tabs');
     refs.tabBtns = {};
-    ['配方', '队列', '执行'].forEach(function (name) {
+    ['队列', '执行'].forEach(function (name) {
       var b = el('button', null, name);
       b.onclick = function () { showTab(name); };
       refs.tabBtns[name] = b;
@@ -1462,11 +1415,9 @@
     refs.body = body;
 
     refs.panes = {
-      配方: el('div'),
       队列: el('div'),
       执行: el('div')
     };
-    buildRecipesPane(refs.panes['配方']);
     buildQueuePane(refs.panes['队列']);
     buildExecPane(refs.panes['执行']);
     Object.keys(refs.panes).forEach(function (k) { body.appendChild(refs.panes[k]); });
@@ -1475,7 +1426,7 @@
     panel = p;
     refs.panel = p;
     enableDrag(head);
-    showTab('配方');
+    showTab('队列');
   }
 
   function enableDrag(handle) {
@@ -1505,84 +1456,7 @@
       refs.tabBtns[k].classList.toggle('on', k === name);
     });
     if (name === '队列') { renderTemplates(); renderQueue(); }
-    if (name === '配方') { renderRecipes(); }
     refreshStatus();
-  }
-
-  function buildRecipesPane(root) {
-    root.innerHTML = '';
-    var bar = el('div', 'row');
-    refs.outSearch = el('input');
-    refs.outSearch.placeholder = '产物 ticker，如 HER';
-    refs.outSearch.style.width = '120px';
-    refs.outSearch.oninput = function () {
-      state.filterOut = refs.outSearch.value.trim();
-      renderRecipes();
-    };
-    bar.appendChild(refs.outSearch);
-    refs.tickerSel = el('select');
-    refs.tickerSel.onchange = function () { state.filterTicker = refs.tickerSel.value; renderRecipes(); };
-    bar.appendChild(refs.tickerSel);
-    var rf = el('button', 'act', '刷新');
-    rf.onclick = function () {
-      loadRecipes(true).then(function () { fillTickers(); renderRecipes(); }, function (e) { log('刷新失败：' + e.message); });
-    };
-    bar.appendChild(rf);
-    root.appendChild(bar);
-    var hint = el('div', 'dim');
-    hint.textContent = '只按产物英文缩写 + 建筑筛，不看中文名';
-    root.appendChild(hint);
-    refs.recipeList = el('div');
-    root.appendChild(refs.recipeList);
-    var count = el('div', 'dim');
-    count.id = 'prun-rec-hint';
-    root.appendChild(count);
-  }
-
-  function fillTickers() {
-    var sel = refs.tickerSel;
-    if (!sel) return;
-    var cur = state.filterTicker;
-    sel.innerHTML = '';
-    var all = el('option', null, '全部建筑');
-    all.value = '';
-    sel.appendChild(all);
-    tickers().forEach(function (t) {
-      var o = el('option', null, t);
-      o.value = t;
-      sel.appendChild(o);
-    });
-    sel.value = cur || '';
-  }
-
-  function renderRecipes() {
-    if (!refs.recipeList) return;
-    fillTickers();
-    refs.recipeList.innerHTML = '';
-    var list = filteredRecipes();
-    var hint = document.getElementById('prun-rec-hint');
-    if (hint) {
-      hint.textContent = state.recipes.length
-        ? '共 ' + state.recipes.length + ' 条配方，显示前 ' + list.length + ' 条匹配'
-        : '还没有配方数据，点「刷新配方」从 prunplanner 拉取';
-    }
-    list.forEach(function (r) {
-      var item = el('div', 'qitem');
-      var top = el('div', 'qtop');
-      var txt = el('div', 'txt');
-      txt.appendChild(el('b', null, r.building_ticker + ' ' + recipeLabel(r)));
-      txt.appendChild(el('div', 'dim', (r._sig || recipeSig(r)) + ' · ' + fmtMs(r.time_ms)));
-      top.appendChild(txt);
-      item.appendChild(top);
-      var bar = el('div', 'qbar');
-      var known = state.lineMap[r.building_ticker];
-      bar.appendChild(el('span', 'dim', known ? '已知生产线：' + known : '生产线未知（扫描后自动关联）'));
-      var b = el('button', 'act', '入队');
-      b.onclick = function () { addToQueue(r); };
-      bar.appendChild(b);
-      item.appendChild(bar);
-      refs.recipeList.appendChild(item);
-    });
   }
 
   function renderTemplates() {
@@ -1691,7 +1565,6 @@
       scanLineTemplates().then(function (found) {
         renderTemplates();
         log('扫描完成：' + found.length + ' 个模板');
-        renderRecipes();
         renderQueue();
         // 顶部的星球/队列 id 行要跟着这次扫描重算，不能停在上一颗星球
         refreshStatus();
@@ -1734,7 +1607,8 @@
         if (!Array.isArray(arr)) throw new Error('文件里不是数组');
         var list = arr.map(normalizeEntry).filter(Boolean);
         if (!list.length) throw new Error('没有一条能认出来（缺 sig/label？）');
-        if (!window.confirm('导入 ' + list.length + ' 条，替换当前 ' + state.queue.length + ' 条队列？')) return;
+        // 直接替换，不弹确认框：导入前队列里是什么并不影响这一步，日志会说明换了多少条
+        log('导入替换：' + list.length + ' 条 ← ' + f.name + '（原队列 ' + state.queue.length + ' 条）');
         state.queue = list;
         saveQueue();
         // 档里带着队列 id 和星球码，顺手并进登记表，换电脑/换浏览器导入后状态栏就认识这些线
@@ -1762,7 +1636,14 @@
       if (window.confirm('清空队列？')) { state.queue = []; saveQueue(); renderQueue(); }
     };
     bar.appendChild(clr);
+    // 执行按钮跟着这三个按钮走：队列一长，原来页尾那个按钮要滚很久才够到
+    refs.run = el('button', 'act', '执行队列');
+    refs.run.style.flex = '1';
+    refs.run.title = '一个工厂一个工厂做完（组内轮转）；是否干跑在「执行」页配置（默认不干跑），这里不弹任何确认';
+    refs.run.onclick = function () { runQueue(state.dryRun); };
+    bar.appendChild(refs.run);
     root.appendChild(bar);
+    syncRunBtn();
 
     root.appendChild(el('div', 'dim',
       '↓ 队列按「工厂」分组：执行时做完一家再做下一家，同一厂里的多条产物按组内顺序轮转；勾了「重复填满」的没有次数上限，下到这条线实测无空位为止。'));
@@ -1787,26 +1668,13 @@
 
     refs.queueList = el('div');
     root.appendChild(refs.queueList);
-
-    // 排好队直接在这一页点执行；是否干跑在执行页配置，这里不弹任何确认
-    var sep = el('div', 'dim');
-    sep.style.cssText = 'padding-top:6px;border-top:1px solid #2f3a49';
-    sep.textContent = '↓ 执行：一个工厂一个工厂做完（组内轮转）；是否干跑在「执行」页配置（默认不干跑）';
-    root.appendChild(sep);
-    var rrow = el('div', 'row');
-    refs.run = el('button', 'act', '执行队列');
-    refs.run.style.flex = '1';
-    refs.run.onclick = function () { runQueue(state.dryRun); };
-    rrow.appendChild(refs.run);
-    root.appendChild(rrow);
-    syncRunBtn();
   }
 
   function renderQueue() {
     if (!refs.queueList) return;
     refs.queueList.innerHTML = '';
     if (!state.queue.length) {
-      refs.queueList.appendChild(el('div', 'dim', '队列为空，从上方模板或「配方」页签入队。'));
+      refs.queueList.appendChild(el('div', 'dim', '队列为空，从上方模板入队或「导入JSON」。'));
       return;
     }
     var names = lineNames();
@@ -2079,7 +1947,7 @@
     if (!panel || !document.body.contains(panel)) {
       buildPanel();
       panel = refs.panel;
-      loadRecipes(false).then(function () { renderRecipes(); refreshStatus(); }, function (e) {
+      loadRecipes(false).then(function () { refreshStatus(); }, function (e) {
         log('配方加载失败：' + e.message);
       });
       // 刚建好就是可见的，不能再 toggle 一次把自己藏掉
